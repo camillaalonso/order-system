@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Backend — build + integration tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: orders
+          POSTGRES_PASSWORD: orders
+          POSTGRES_DB: orders
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orders -d orders"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      DATABASE_URL: postgresql://orders:orders@localhost:5432/orders
+      QUOTATION_SERVICE_URL: http://localhost:3001
+      NODE_ENV: test
+      LOG_LEVEL: error
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      # Os testes de integração rodam contra `orders_test` (ver vitest.config.ts).
+      # O global-setup tenta criar via `docker compose exec` e silencia o erro fora
+      # do dev local — então criamos o banco aqui antes de rodar a suíte.
+      - name: Create test database
+        env:
+          PGPASSWORD: orders
+        run: psql -h localhost -U orders -d orders -c "CREATE DATABASE orders_test;"
+
+      - name: Build (tsc)
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+  frontend:
+    name: Frontend — build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: Build (production)
+        run: npm run build

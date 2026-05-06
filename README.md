@@ -44,7 +44,7 @@ A ordem importa: o backend depende do quotation-service, e o frontend depende do
 
 ### 1. Quotation service (terminal 1)
 
-Serviço fornecido pelo desafio, simula um fornecedor instável de cotações.
+Serviço fornecido pelo desafio, simula um fornecedor de cotações instavel.
 
 ```bash
 cd case-eng-dist/quotation-service
