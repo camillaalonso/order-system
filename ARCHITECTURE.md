@@ -1,303 +1,197 @@
 # Arquitetura AWS — Sistema de Ordens de Investimento
 
-> Documento técnico do desenho de arquitetura para o sistema de ordens.
+Este documento descreve o desenho da arquitetura. O objetivo desde o começo foi suportar o volume alvo do produto sem retrabalho no primeiro pico: ~1.000 ordens/s sustentadas, ~50.000 usuários simultâneos e ~10.000 consultas de cotação/s.
 
----
+Três coisas guiaram as escolhas:
+- Operação que toca saldo é ACID, sempre.
+- O sistema precisa continuar de pé mesmo se o provedor de cotações cair.
+- Tudo tem que ser observável. Se eu não consigo investigar um incidente às 3 da manhã, o desenho está errado.
 
-## Sumário
+A arquitetura tem cinco partes: borda (Route 53, CloudFront, WAF, ALB), aplicação rodando em ECS Fargate, dados em Aurora PostgreSQL e Redis, mensageria em SQS FIFO e o pipeline de auditoria via EventBridge → Firehose → S3. Diagrama em `docs/architecture/order-system.svg`.
 
-1. [Visão geral](#1-visão-geral)
-2. [Decisões principais](#2-decisões-principais)
-3. [Justificativa das escolhas](#3-justificativa-das-escolhas)
-4. [Escalabilidade](#4-escalabilidade)
-5. [Resiliência e tratamento de falhas](#5-resiliência-e-tratamento-de-falhas)
-6. [Evolução do produto](#6-evolução-do-produto)
-7. [Segurança](#7-segurança)
-8. [Observabilidade](#8-observabilidade)
-9. [Estimativa de custos](#9-estimativa-de-custos)
-10. [Tratamento de concorrência](#10-tratamento-de-concorrência)
+## Componentes
 
----
+**Borda.** 
+Route 53 resolve o domínio com health check. CloudFront distribui o frontend estático e termina TLS. WAF na frente do CloudFront filtra ataque comum (SQLi, XSS, IPs maliciosos via AWS Managed Rules) e faz rate limit por IP. O ALB distribui para as tasks ECS e valida JWT do Cognito antes do tráfego chegar na app.
 
-## 1. Visão geral
+**Rede.** 
+VPC em 3 AZs. Subnet pública só com ALB e NAT Gateway. ECS, Aurora e Redis ficam todos em subnet privada, sem rota direta para a internet. para a falar com S3, ECR, Secrets Manager e CloudWatch Logs uso VPC Endpoint, evitando o NAT.
 
-A arquitetura foi desenhada para suportar o volume alvo do produto desde o início (≈1.000 ordens/s sustentadas, ≈50.000 usuários simultâneos, ≈10.000 consultas de cotação/s) com foco em três princípios não-negociáveis para um sistema financeiro:
+**Aplicação.** 
+Cinco services no ECS Fargate:
+- `orders-api`: recebe ordens via HTTP, valida idempotência e empurra para o  SQS FIFO.
+- `quotes-api`: lê cotação do Redis (alvo de 10k req/s).
+- `positions-api`: consulta saldo e histórico, sempre na Read Replica.
+- `orders-worker`: o cara que importa. Consome SQS FIFO, executa a transação ACID no Aurora e publica evento de auditoria.
+- `quotes-ingestor`: worker em loop que busca cotação no provedor externo e atualiza o Redis.
 
-- **Integridade** — toda operação que toca o saldo do cliente roda dentro de transação ACID, com auditoria imutável.
-- **Resiliência** — o sistema continua operando de forma segura mesmo quando o provedor externo de cotações está indisponível ou lento.
-- **Observabilidade** — todo estado do sistema é mensurável e investigável, com alertas automatizados para os modos de falha conhecidos.
+**Dados.** 
+Aurora PostgreSQL Serverless v2 como Writer (Multi-AZ), uma Read Replica para as consultas de posição e relatório. ElastiCache Redis em cluster mode para o  cache de cotações com TTL curto.
 
-A arquitetura é dividida em camadas: borda (Route 53, CloudFront, WAF, ALB), aplicação (ECS Fargate com cinco services em subnet privada), dados (Aurora PostgreSQL e ElastiCache Redis), mensageria (SQS FIFO + DLQ), auditoria (EventBridge → Firehose → S3 → Athena) e plataforma transversal (CloudWatch, SNS, Secrets Manager, KMS, Cognito).
+**Mensageria.** 
+SQS FIFO com `MessageGroupId=userId`, DLQ que captura mensagem que falha 3 vezes seguidas.
 
----
+**Auditoria.** 
+EventBridge recebe evento de mudança de estado de ordem. Kinesis Data Firehose agrega em Parquet e joga no S3 com Object Lock (7 anos, modo compliance). Athena para a consulta ad hoc.
 
-## 2. Decisões principais
+**Plataforma.** 
+CloudWatch (logs, métricas, alarmes) com SNS distribuindo alerta para o  PagerDuty, e-mail e Slack. X-Ray para a tracing. Secrets Manager para as credenciais (Aurora, API key do provedor) com rotação. KMS para a encryption at rest. GuardDuty + Security Hub + CloudTrail para a detecção e auditoria de API AWS.
 
-| Camada | Escolha | Por quê |
-|---|---|---|
-| Compute | ECS Fargate | Tráfego sustentado (não picos esporádicos), inclui workers de fila de longa duração, sem necessidade de equipe de plataforma |
-| Async de ordens | SQS FIFO + DLQ | Ordenação por usuário via `MessageGroupId=userId`, absorve picos sem bloquear o `orders-api` |
-| Banco | Aurora PostgreSQL Serverless v2, Multi-AZ + 1 read replica | ACID inegociável em sistema financeiro |
-| Cache de cotações | ElastiCache Redis (cluster mode) | Sub-milissegundo, absorve 10k req/s sem matar o provedor externo |
-| Borda HTTP | Application Load Balancer | A 1k+ req/s sustentado, mais barato que API Gateway |
-| Auth | Cognito User Pool | Não fazer auth caseira em sistema financeiro |
-| Frontend | CloudFront + S3 (Next.js export) | CDN separada de origem, mais barato que Amplify Hosting em escala |
-| Auditoria | EventBridge → Kinesis Firehose → S3 audit-archive (Parquet, Object Lock) → Athena | Compliance ~7 anos com pesquisa rápida sob demanda |
-| CI/CD | GitHub Actions → ECR → CodeDeploy (blue/green) | OIDC sem chaves estáticas, rollback automático em falha de health check |
+**CI/CD.** 
+GitHub Actions com OIDC (sem chave estática), publica imagem no ECR e CodeDeploy faz blue/green nas tasks com rollback automático em falha de health check.
 
----
+## Decisões principais
 
-## 3. Justificativa das escolhas
+### Compute: ECS Fargate
+A primeira escolha foi não usar Lambda no caminho crítico. Lambda funciona bem para o  `orders-api`, mas `orders-worker` e `quotes-ingestor` rodam em loop e precisam de conexão persistente com Redis e Aurora. Para esse perfil Lambda fica caro e a latência de cold start atrapalha.
+EKS ficou fora pois o que justifica o Kubernetes (scheduling avançado, service mesh, portabilidade entre clouds) não aparece em cinco services com o mesmo padrão de deploy. EC2 foi descartado pois precisaria montar a orquestração de container em cima e cuidar de AMI e patching, o Fargate já resolve.
+Fargate cobra por segundo, integra nativamente com ECR, ALB e CodeDeploy, e usa o mesmo modelo de deploy para a HTTP e workers de fila.
 
-### 3.1. Compute — por que ECS Fargate
+### Mensageria: SQS FIFO
+Considerei Kinesis Data Streams. Ganharia em throughput puro mas SQS FIFO já dá conta de 1k ordens/s, e operar Kinesis (shard, retenção, capacidade) é mais trabalhoso. 
+SNS+SQS fanout não fazia sentido porque tem só um consumidor da ordem (`orders-worker`). EventBridge entra na auditoria, não no caminho crítico.
+`MessageGroupId = userId`. Garante ordem estrita por usuário sem precisar implementar lock no banco nem na app. Resolve race condition que apareceria em outros designs.
 
-**Alternativas consideradas:**
+### Banco: Aurora PostgreSQL
+DynamoDB não cabe. Operação financeira tem transação multi-row com restrição (saldo, posição, histórico), e o modelo relacional é mais natural. Transactions do DynamoDB são limitadas e o modelo de dados teria que ser denormalizado de um jeito que dificulta evolução.
+O Aurora é melhor pela replicação sub-segundo entre Writer e Reader e pelo failover Multi-AZ rápido. Aurora Serverless v2 sobre Aurora provisionado por causa do perfil de tráfego: tem pico previsível (abertura e fechamento de mercado).
 
-- **AWS Lambda** — ideal para o `orders-api` (tráfego HTTP) e parte do `quotes-api`. Descartado para o `orders-worker` e o `quotes-ingestor`, que rodam em loop e precisam de conexão persistente com Redis/Aurora — Lambda fica caro e ineficiente para essa carga.
-- **EKS** — descartado pelo overhead operacional. O time não tem demanda de portabilidade entre clouds nem padrões avançados de orquestração que justifiquem manter um control plane Kubernetes.
-- **EC2 com Auto Scaling Group** — descartado por exigir gestão de patches, AMIs e orquestração de containers manualmente.
+### Cache: ElastiCache Redis
+Cache em memória local (Caffeine, node-cache) está fora porque cada task do `quotes-api` teria seu próprio estado, e para 50k usuários simultâneos isso vira inconsistência feia. Memcached funcionaria mas o Redis tem cluster mode com sharding nativo e estruturas que provavelmente vou usar depois (sorted set, pub/sub para invalidação cross-cluster).
 
-Fargate equilibra: zero gestão de servidor, billing por segundo, integração nativa com ECR/CodeDeploy/ALB e suporta tanto serviços HTTP quanto workers de fila com o mesmo modelo de deploy.
 
-### 3.2. Mensageria — por que SQS FIFO
+### Borda: ALB e não API Gateway
+API Gateway é melhor para serverless de baixo volume com cobrança por request. A 1k req/s sustentadas aumenta muito o custo. ALB tem custo fixo + LCU e fica bem mais barato.
 
-**Alternativas consideradas:**
+### Frontend: CloudFront + S3
+Amplify Hosting é mais simples, o controle sobre regra de cache é menor. Em volume mais alto CloudFront direto sai melhor e dá controle sobre TTL.
 
-- **Kinesis Data Streams** — superior em throughput puro, mas SQS FIFO é suficiente para 1k ordens/s (limite de 3k msg/s por grupo e dezenas de milhares por fila com batching). SQS FIFO é mais simples de operar e barato.
-- **SNS + SQS fanout** — adicionaria latência sem ganho real para esse caso, onde só temos um consumidor (`orders-worker`).
-- **EventBridge** — usado para auditoria, não para o caminho crítico da ordem. EventBridge tem latência maior e não garante FIFO por chave.
+## Escalabilidade
+A borda escala sozinha. CloudFront serve do edge e o ALB cresce em LCU conforme o tráfego.
+No ECS, cada service tem autoscaling por métrica diferente:
+- `orders-api`, `quotes-api`, `positions-api`: CPU em alvo de 60% e contagem de requests por target (target tracking).
+- `orders-worker`: profundidade da fila (`ApproximateNumberOfMessagesVisible`). Pico de ordens dispara task nova automaticamente.
+- `quotes-ingestor`: número de provedores integrados, não carga. Tipicamente 2-3 tasks por provedor.
+SQS é praticamente ilimitado. O limite efetivo é o `MessageGroupId`, que serializa por grupo. É suficiente para 50k usuários.
+Aurora Writer escala vertical via Serverless v2 (0.5 a 128 ACUs). Read replica absorve consulta de posição. Se precisar de mais leitura, dá para colocar até 15 replicas no cluster.
+Redis em cluster mode adiciona shard linearmente. Replicação dentro do shard cobre leitura.
+- 
+Três gargalos: O provedor de cotações é externo e tem rate limit; mitiga com cache agressivo (TTL 1-5s), reduzindo o tráfego saindo da AWS para uma fração mínima dos 10k req/s recebidos. O Aurora Writer é gargalo natural num sistema ACID, e o SQS na frente suaviza pico, mais ler de Reader desafoga. NAT Gateway tem limite de banda; em volume bem alto, considerar NAT por AZ e empurrar o que der para VPC Endpoint.
 
-A propriedade-chave é o `MessageGroupId = userId`: ordens do mesmo usuário são processadas em ordem estrita, evitando race conditions sem precisar de lock no banco.
+## Resiliência
 
-### 3.3. Banco — por que Aurora PostgreSQL
+### Provedor de cotações fora do ar
+Esse é o cenário mais provável. O sistema continua operando:
+- O `quotes-ingestor` falha ao buscar cotação. O Redis mantém o último valor com TTL curto. Depois do TTL, o dado expira.
+- O `quotes-api` consulta Redis. Se tem valor, devolve. Se não tem (miss), tenta o provedor direto. Se o provedor também tá fora, devolve `503` em vez de inventar preço.
+- O `orders-worker` consulta Redis a preço de mercado durante o processamento. Se Redis e provedor estão ambos fora, marca a ordem como `REJECTED` com motivo claro. Não fica em loop tentando.
+É melhor rejeitar uma ordem com mensagem clara do que executar com preço incorreto.
 
-**Alternativas consideradas:**
+### Worker fora
+Se todas as tasks do `orders-worker` caem, mensagens ficam empilhadas no SQS. Alarme de `ApproximateAgeOfOldestMessage > 60s` dispara via SNS, e o autoscaling sobe task nova em poucos minutos. Nada é perdido.
 
-- **DynamoDB** — descartado. Operações financeiras precisam de transações multi-row com restrições (saldo, posição, histórico de ordens) e o modelo relacional cabe melhor. Transactions do DynamoDB são limitadas e o modelo de dados forçaria denormalização.
-- **RDS PostgreSQL tradicional** — funciona, mas Aurora oferece replicação mais rápida (sub-segundo entre Writer e Reader), failover Multi-AZ em ~30s e Serverless v2 escala vertical sem janela de manutenção.
+### Aurora fora
+Failover Multi-AZ promove standby a Writer em ~30s. Durante o failover, o `orders-worker` recebe erro de conexão e a mensagem volta para a fila pelo visibility timeout. Quando o banco volta, processa.
 
-Aurora Serverless v2 foi escolhido sobre Aurora provisionado por escalar automaticamente conforme a carga e cobrar por ACU consumida — combina bem com o perfil de tráfego financeiro, que tem picos diários previsíveis (abertura/fechamento de mercado).
+### Redis fora
+`quotes-api` cai no fallback descrito acima. para o  `orders-worker`, sem cache nem provedor, a ordem volta para a fila e eventualmente para o DLQ depois dos retries.
 
-### 3.4. Cache — por que ElastiCache Redis
+### Mensagens venenosas
+Mensagem que falha 3 vezes vai para o DLQ (redrive policy do SQS). Alarme em `ApproximateNumberOfMessagesVisible > 0` no DLQ dispara para o time imediatamente. Uma mensagem ruim não pode bloquear a fila inteira, então isolar na DLQ resolve.
 
-**Alternativas consideradas:**
+### Multi-AZ
+Tudo replicado em 3 AZs: Aurora, Redis, ECS distribuído, NAT por AZ na config ideal. Perda de uma AZ inteira não derruba operação.
 
-- **DAX** — exclusivo para DynamoDB, não se aplica.
-- **Cache em memória local na app (Caffeine, node-cache)** — descartado por inviabilizar consistência entre as N tasks do `quotes-api`. Cada task teria seu próprio cache desatualizado.
-- **Memcached** — viável, mas Redis tem estruturas mais ricas (sorted sets, pub/sub para invalidação cross-cluster) e suporte nativo a cluster mode com sharding.
+## Evolução
+- O que muda quando um segundo provedor de cotações for integrado?
+Praticamente nada na infra. As únicas mudanças ficam no `quotes-ingestor` e em uma regra de leitura no `quotes-api`:
+1. Sobe uma nova task do `quotes-ingestor` configurada para o provedor secundário. Cada ingestor é independente e isolado por config.
+2. As chaves no Redis passam a incluir o provedor (`quote:ITUB4:b3`, `quote:ITUB4:bloomberg`) em vez de uma chave única por símbolo.
+3. O `quotes-api` ganha uma regra de prioridade simples: lê do primário; se ausente ou stale, cai no secundário.
+4. Um alerta dispara quando os dois provedores discordam acima de um threshold, para revisão manual.
+`orders-worker`, Aurora, SQS, ALB e o resto do pipeline não mudam. A separação entre ingestão (escreve no Redis) e leitura (lê do Redis) é o que torna isso barato: trocar ou adicionar fonte de dados não toca o caminho crítico da ordem.
 
-### 3.5. Borda — por que ALB e não API Gateway
+- O que muda quando um novo tipo de ativo for adicionado?
+Também nada na infra. A tabela `assets` já tem o campo `asset_class` (equity, crypto, fixed_income, etc.), e o pipeline (ALB → `orders-api` → SQS → `orders-worker` → Aurora) trabalha com qualquer ordem no formato `{symbol, type, quantity, price}`. As mudanças ficam todas em código de domínio:
+1. Inserir os ativos novos na tabela `assets` com a `asset_class` correta.
+2. Implementar as regras de negócio específicas da nova classe (derivativo tem vencimento e margem, fundo tem cota diária e janela de resgate, renda fixa tem yield e indexador, etc.).
+3. Apontar o `quotes-ingestor` para o feed do novo ativo se vier de fonte diferente do provedor já integrado.
 
-API Gateway brilha em arquitetura serverless com baixo volume e cobrança por request. A 1.000+ req/s sustentadas, o custo do API Gateway escala linearmente e ultrapassa em muito o ALB, que tem custo fixo + LCU (Load Balancer Capacity Units). Para HTTP convencional com integração ao ECS, ALB é a escolha econômica e tecnicamente equivalente.
+Nenhum recurso AWS é provisionado, nenhum service é redeployado fora do ciclo normal, e não há mudança de schema além das colunas específicas da nova classe.
 
-### 3.6. Frontend — por que CloudFront + S3 e não Amplify Hosting
+## Segurança
 
-Amplify Hosting é mais simples (faz build e deploy automaticamente), mas tem menos controle sobre regras de cache, custo escala mais rápido em volume e a integração com WAF/Shield é menos flexível. Em 50k usuários simultâneos, CloudFront + S3 self-managed é mais barato e dá controle fino sobre TTL, invalidações e regras de borda.
+### Auth
+Cognito User Pool gerencia cadastro, login e emite JWT. O ALB valida o token via integração nativa com Cognito (listener rule `authenticate-cognito`), bloqueando token inválido antes do backend. A app usa só a claim `sub` para identificar o usuário, sem revalidar.
 
----
+### Rede
+ALB aceita 443 da internet e fala só com ECS na porta da app. ECS fala só com Aurora (5432), Redis (6379) e endpoints AWS. Aurora e Redis aceitam só conexão do ECS via Security Group por camada, mais VPC Endpoint para serviço AWS evitando passar pela internet pública.
 
-## 4. Escalabilidade
+### Credenciais e criptografia
+Senha do Aurora, API key do provedor e tokens internos ficam no Secrets Manager. Cada task tem IAM Role com permissão de ler só o secret específico do serviço. Encryption at rest via KMS em todo recurso com dado sensível: Aurora, S3 (frontend e auditoria), Redis, Secrets, Logs. TLS ponta a ponta para in-transit.
 
-### 4.1. Por camada
+## Observabilidade
 
-**Borda (Route 53 / CloudFront / WAF / ALB):** todos escalam horizontalmente sem intervenção. CloudFront serve assets estáticos do edge, reduzindo carga na origem. ALB escala automaticamente conforme LCUs aumentam.
+Logs estruturados em JSON para o CloudWatch Logs via `awslogs` driver no ECS. Cada log tem `requestId` e `orderId`, então dá para seguir uma ordem específica do `orders-api` até o `orders-worker`.
 
-**Aplicação (ECS Fargate):** cada service tem **Auto Scaling** configurado por métricas relevantes:
-
-- `orders-api`, `quotes-api`, `positions-api`: escalam por CPU (alvo 60%) e por contagem de requests/target via target tracking.
-- `orders-worker`: escala por **profundidade da fila** (`ApproximateNumberOfMessagesVisible` no SQS) — métrica customizada via CloudWatch. Picos de ordens disparam novas tasks automaticamente.
-- `quotes-ingestor`: escala por número de provedores integrados (não por carga), tipicamente 2-3 tasks por provedor.
-
-**Mensageria (SQS):** capacidade praticamente ilimitada. O limite prático é o `MessageGroupId` — cada grupo (usuário) processa sequencialmente. Como temos 50k usuários, o paralelismo efetivo é alto.
-
-**Banco (Aurora):** Writer escala vertical via Serverless v2 (de 0.5 a 128 ACUs). Read replica absorve consultas de posição. Em caso de carga ainda maior, é possível adicionar até 15 read replicas no cluster.
-
-**Cache (Redis):** cluster mode com sharding. Adicionar shards aumenta throughput linearmente. Replicação dentro de cada shard garante read scalability.
-
-### 4.2. Gargalos identificados
-
-1. **Provedor externo de cotações** — limite externo, fora do nosso controle. Mitigamos com cache agressivo no Redis (TTL 1-5s), reduzindo o tráfego saindo da AWS para uma fração mínima dos 10k req/s recebidos.
-2. **Aurora Writer** — gargalo natural em sistema financeiro com requisito ACID. Mitigamos com fila SQS na frente (suaviza picos) e separação read/write (consultas de posição vão para Reader).
-3. **NAT Gateway** — único ponto de saída para o provedor externo. Em volume muito alto, considerar NAT Gateway por AZ ou substituir parte do tráfego por VPC Endpoints (para serviços AWS).
-
----
-
-## 5. Resiliência e tratamento de falhas
-
-### 5.1. Provedor de cotações indisponível ou lento
-
-O sistema é desenhado para **continuar operando mesmo com o provedor offline**:
-
-- O `quotes-ingestor` falha ao buscar cotações nova → o Redis mantém o último valor com TTL curto (5s). Após o TTL, os dados expiram.
-- O `quotes-api` consulta Redis. Se o valor existe, devolve normalmente. Se expirou (Redis miss), aplica **circuit breaker**: tenta buscar do provedor diretamente. Se o provedor também falha, retorna `503 Service Unavailable` em vez de inventar preço.
-- O `orders-worker` consulta o Redis para obter preço de mercado durante o processamento. Em caso de falha do Redis E do provedor, a ordem é marcada como `REJECTED` com motivo claro, não fica em loop tentando.
-
-**Princípio:** preferimos **rejeitar uma ordem com mensagem clara** a executá-la com preço incorreto. Em sistema financeiro, errar para mais é tão grave quanto errar para menos.
-
-### 5.2. Worker indisponível
-
-Se todas as tasks do `orders-worker` caem, as mensagens permanecem na fila SQS. CloudWatch Alarm dispara em `ApproximateAgeOfOldestMessage > 60s`, notificando via SNS. ECS Service Auto Scaling reage em poucos minutos subindo novas tasks. Nenhuma ordem é perdida.
-
-### 5.3. Aurora Writer indisponível
-
-Failover Multi-AZ promove uma standby para Writer em ~30 segundos. Durante o failover, o `orders-worker` recebe erro de conexão e retorna a mensagem para a fila (visibility timeout). Após o failover, processa normalmente.
-
-### 5.4. Redis indisponível
-
-`quotes-api` aplica fallback descrito em 5.1. Para o `orders-worker`, que precisa de preço para processar a ordem, se o Redis cai, ele tenta o provedor diretamente. Se o provedor também falha, a ordem volta para a fila ou vai para DLQ após retries.
-
-### 5.5. Mensagens venenosas — Dead Letter Queue
-
-Mensagens que falham 3 vezes consecutivas no `orders-worker` (bug, dado corrompido, erro persistente) são automaticamente movidas para a DLQ pela política de redrive do SQS. Um CloudWatch Alarm em `ApproximateNumberOfMessagesVisible > 0` na DLQ dispara notificação SNS imediata para o time on-call investigar.
-
-**Princípio:** uma mensagem ruim não pode bloquear a fila inteira. Isolamos o problema na DLQ + alarme automático.
-
-### 5.6. Multi-AZ por padrão
-
-Toda a infraestrutura é replicada em 3 Availability Zones (Aurora, Redis, ECS tasks distribuídas, NAT Gateway por AZ na configuração ideal). A perda de uma AZ inteira não impacta operação.
-
----
-
-## 6. Evolução do produto
-
-### 6.1. Múltiplos provedores de cotações
-
-Adicionar um segundo provedor não exige mudanças no `quotes-api` nem no `orders-worker`. A arquitetura suporta:
-
-1. Subir uma nova task do `quotes-ingestor` configurada para o segundo provedor.
-2. Cada ingestor escreve no Redis com chave que inclui o provedor (`quote:ITUB4:b3`, `quote:ITUB4:bloomberg`).
-3. O `quotes-api` aplica regra de prioridade: lê do provedor primário; se ausente ou stale, fallback para o secundário.
-4. Quando dois provedores discordam significativamente, dispara alerta para investigação manual.
-
-A separação clara entre **ingestão** e **leitura** via Redis permite essa evolução sem refatoração do caminho crítico.
-
-### 6.2. Novos tipos de ativo
-
-O modelo de dados do banco usa um campo `asset_class` (equity, crypto, fixed_income, etc.) e regras de negócio aplicadas por classe. Adicionar um novo tipo de ativo requer:
-
-1. Inserir os ativos novos na tabela `assets` com o `asset_class` apropriado.
-2. Implementar regras específicas no domínio (ex: derivativos têm vencimento, fundos têm cota diária) — código novo, sem mudança em infraestrutura.
-3. Configurar o `quotes-ingestor` para o feed do novo ativo, se vier de fonte diferente.
-
-A arquitetura é **agnóstica ao tipo de ativo** — todo o pipeline (ALB → API → fila → worker → banco) já suporta qualquer ordem que se encaixe no modelo `{symbol, type, quantity, price}`.
-
----
-
-## 7. Segurança
-
-### 7.1. Autenticação e autorização
-
-Login do usuário é gerenciado pelo Cognito User Pool, que devolve um JWT. O ALB valida o JWT em cada requisição autenticada via integração nativa com Cognito (listener rule `authenticate-cognito`), bloqueando tokens inválidos antes que cheguem na aplicação. O backend usa a claim `sub` do JWT para identificar o usuário, sem precisar validar token novamente.
-
-### 7.2. Rede
-
-- **VPC com 3 Availability Zones**, subnets públicas (ALB, NAT Gateway) e privadas (ECS, Aurora, Redis).
-- **Security Groups por camada**: ALB aceita tráfego da internet (porta 443) e fala apenas com o ECS na porta da app; ECS fala apenas com Aurora (5432), Redis (6379), e endpoints AWS; Aurora e Redis aceitam apenas conexões do ECS.
-- **VPC Endpoints** para S3, ECR, Secrets Manager e CloudWatch Logs — tráfego não passa pela internet pública.
-
-### 7.3. Credenciais e criptografia
-
-Credenciais sensíveis (senha do Aurora, API key do provedor de cotações, tokens internos) são armazenadas no Secrets Manager. Cada ECS Task tem IAM Role com permissão de leitura apenas pro secret específico daquele serviço (least privilege). Encryption at rest é feito por KMS em todos os recursos com dados sensíveis: Aurora, S3 (frontend e auditoria), Redis, Secrets Manager e CloudWatch Logs. Encryption in transit é TLS ponta a ponta.
-
-### 7.4. Filtragem de tráfego
-
-WAF na frente do CloudFront filtra ataques comuns (SQL injection, XSS, IPs maliciosos via AWS Managed Rules, rate limiting por IP). CloudFront fornece proteção DDoS L3/L4 via AWS Shield Standard incluído.
-
-### 7.5. Detecção de ameaças
-
-- **GuardDuty** habilitado na conta — detecta atividade anômala (acesso de IPs suspeitos, comunicação com C&C servers, comportamento atípico de IAM).
-- **Security Hub** consolida findings de GuardDuty, Inspector e checks de compliance (CIS, AWS Foundational Best Practices).
-- **CloudTrail** registra todas as chamadas de API AWS — trilha de auditoria para investigação forense.
-
----
-
-## 8. Observabilidade
-
-### 8.1. Logs
-
-Toda a infraestrutura envia logs estruturados em JSON para CloudWatch Logs via `awslogs` driver no ECS. Cada log inclui correlação por `requestId` e `orderId`, permitindo seguir uma ordem específica do `orders-api` até o `orders-worker`.
-
-### 8.2. Métricas e alarmes
-
-Alarmes mínimos configurados no CloudWatch:
+Alarmes mínimos:
 
 | Métrica | Threshold | O que indica |
 |---|---|---|
-| `SQS.ApproximateAgeOfOldestMessage` | > 60s | Fila parada (worker caiu ou está lento) |
+| `SQS.ApproximateAgeOfOldestMessage` | > 60s | Fila parada (worker caiu ou degradou) |
 | `SQS.ApproximateNumberOfMessagesVisible` (DLQ) | > 0 | Ordens estão falhando |
 | `ECS.RunningTaskCount` | < desired | Tasks caíram |
 | `RDS.CPUUtilization` | > 80% por 5min | Banco sob pressão |
-| `ALB.HTTPCode_5XX_Count` | > 1% das requests | Erros de borda ou backend |
-| `Custom.QuotesIngestorHeartbeat` | ausente por 30s | Cotações ficando stale |
+| `ALB.HTTPCode_5XX_Count` | > 1% | Erro de borda ou backend |
+| `Custom.QuotesIngestorHeartbeat` | ausente por 30s | Cotação ficando stale |
 
-Alarmes notificam um tópico SNS único, que distribui para PagerDuty (oncall), e-mail e Slack.
+Alertas vão para um SNS único e de lá para o PagerDuty (oncall), e-mail.
+X-Ray instrumenta as tasks via SDK + sidecar. Cada request gera trace cobrindo ALB → app → Redis/Aurora/SQS.
 
-### 8.3. Tracing distribuído
+### Investigando "ordens não estão sendo processadas"
+Quando esse alerta toca:
+1. DLQ tem mensagem? Se sim, lê uma para ver o erro.
+2. Idade da mensagem mais antiga na fila principal cresceu? Worker está parado ou degradado.
+3. Quantas tasks do `orders-worker` estão rodando? Caiu? Autoscaling não reagiu?
+4. Logs do worker filtrando pelo `orderId` da DLQ ou pela última hora. Qual exception?
+5. Métrica do Aurora: CPU, conexão ativa, deadlock, latência de query.
+6. Redis e provedor: falha externa pode estar rejeitando ordem em massa.
+7. Trace do X-Ray da última ordem que tentou processar. Onde gastou tempo?
+8. Athena no `audit-archive`: quantas ordens viraram `REJECTED` na última hora? Tem padrão por usuário, ativo ou motivo?
 
-X-Ray instrumenta todas as tasks ECS via SDK + sidecar. Cada request gera um trace com spans cobrindo: ALB → app → Redis/Aurora/SQS. Permite identificar latência em cada camada e propagar contexto entre serviços.
+### Auditoria
+Toda mudança de estado de ordem é publicada como evento no EventBridge logo após commit no Aurora, fora da transação.
+O Firehose agrega em batch (5 minutos ou 5MB) e escreve em Parquet particionado por data no S3 `audit-archive`. O bucket usa Object Lock em modo compliance, então nem o root da conta consegue apagar registro durante a retenção. Athena lê direto do Parquet para a investigação ad hoc e relatório regulatório. EventBridge no meio facilita adicionar consumidor depois (detecção de fraude, BI, analytics) sem mexer no `orders-worker`.
 
-### 8.4. Investigação do alerta "ordens não estão sendo processadas"
+## Custos
+Estimativa mensal aproximada para o  volume alvo, em us-east-1:
 
-Sequência típica de investigação:
-
-1. **Profundidade da DLQ** — se há mensagens, ler conteúdo de uma para ver o erro original.
-2. **Idade da mensagem mais antiga na fila principal** — se cresceu, worker está parado ou degradado.
-3. **Contagem de tasks do `orders-worker`** — caiu? autoscaling não reagiu?
-4. **Logs do worker** filtrados pelo `orderId` da DLQ ou pela última hora — qual exception?
-5. **Métricas do Aurora** — CPU, conexões ativas, deadlocks, latência de query.
-6. **Métricas do Redis e do provedor** — falha externa pode estar causando rejeição em massa.
-7. **Trace X-Ray** da última ordem que tentou processar — onde gastou tempo?
-8. **Athena no S3 audit-archive** — quantas ordens foram para `REJECTED` na última hora? Padrão por usuário, ativo, motivo?
-
-### 8.5. Auditoria
-
-Toda mudança de estado de uma ordem é publicada como evento no EventBridge (`audit-bus`) imediatamente após o commit no Aurora — fora da transação de banco, pra não acoplar a publicação à integridade financeira. O EventBridge roteia o evento pro Kinesis Data Firehose, que agrega em batches (5 minutos ou 5MB) e escreve em formato Parquet particionado por data no S3 `audit-archive`. O bucket usa Object Lock no modo compliance, garantindo imutabilidade WORM (Write Once Read Many) — nem o root da conta consegue deletar registros durante o período de retenção. Consultas ad hoc pra investigação de incidentes, relatórios regulatórios e auditoria são executadas via Athena, que roda SQL diretamente sobre os arquivos Parquet sem precisar de cluster provisionado. O desacoplamento via EventBridge permite adicionar novos consumidores no futuro (detecção de fraude, BI, analytics) sem alterar o `orders-worker`.
-
----
-
-## 9. Estimativa de custos
-
-Estimativa mensal aproximada para o volume alvo (~1k ordens/s, 50k usuários simultâneos), região us-east-1:
-
-| Componente | Custo estimado/mês | Notas |
+| Componente | Estimativa | Notas |
 |---|---|---|
-| ECS Fargate (15-25 tasks médias) | $1.500 — $3.000 | Maior componente; varia com auto-scaling |
-| Aurora Serverless v2 (Writer + 1 Reader) | $500 — $1.500 | 2-8 ACUs em média; picos em horário de mercado |
+| ECS Fargate (15-25 tasks médias) | $1.500 — $3.000 | Maior componente, varia com autoscaling |
+| Aurora Serverless v2 (Writer + 1 Reader) | $500 — $1.500 | 2-8 ACUs em média, picos no horário de mercado |
 | ElastiCache Redis (cluster, 3 shards × 2 nodes) | $200 — $500 | cache.r7g.large por shard |
 | ALB | $25 — $100 | Custo fixo + LCU |
 | NAT Gateway | $50 — $200 | $0.045/h + $0.045/GB processado |
 | SQS + EventBridge + Firehose | $100 — $300 | Volume de eventos |
-| S3 (frontend + audit-archive) | $20 — $80 | Audit cresce ao longo do tempo; lifecycle pra Glacier reduz custo |
-| Athena | $5 — $50 | Pago por query (TB escaneado); muito baixo se queries são raras |
-| CloudWatch (Logs + Metrics + Alarms) | $200 — $500 | Logs detalhados são o maior componente |
+| S3 (frontend + audit-archive) | $20 — $80 | Audit cresce com tempo, lifecycle para Glacier reduz |
+| Athena | $5 — $50 | Por TB escaneado, baixo se query for rara |
+| CloudWatch (Logs, Metrics, Alarms) | $200 — $500 | Logs detalhados são o pior |
 | Cognito | ~$50 | 50k MAU dentro do tier de $0.0055/MAU |
 | WAF | $20 — $50 | Custo fixo por web ACL + por request |
 | CloudFront | $50 — $200 | Por GB transferido + por request |
 | KMS, Secrets Manager, GuardDuty, Security Hub | $50 — $150 | Custo administrativo |
-| **Total estimado** | **~$2.800 — $6.700** | Ordem de grandeza, ajustar com observabilidade real |
+| **Total** | **~$2.800 — $6.700** | Ordem de grandeza, calibrar com observabilidade real |
 
-Os principais alavancas de redução de custo são: agressividade do auto-scaling do ECS (não manter sobreprovisionamento em horário ocioso), TTL do cache Redis (mais alto = menos chamadas ao provedor) e retenção de logs do CloudWatch (logs de debug podem ser exportados para S3 + lifecycle).
+Corte de custo: agressividade do autoscaling do ECS (não manter capacidade em horário ocioso), TTL do Redis (mais alto = menos chamada ao provedor) e retenção de log do CloudWatch (debug pode ir para S3 com lifecycle).
 
----
+## Concorrência
+Cenário clássico: João tem 100 unidades de ITUB4 e dispara duas ordens de venda de 80 simultaneamente.
+1. As duas ordens entram pelo `orders-api` e vão para o  SQS FIFO com `MessageGroupId = "user-001"`.
+2. SQS FIFO entrega mensagem do mesmo group ID em ordem estrita, e o consumo é serializado: uma única task processa o grupo de cada vez. Não existe paralelismo dentro do grupo.
+3. O worker pega a primeira ordem, abre transação, valida saldo (100 disponíveis), debita 80, sobra 20, commita. Ordem `EXECUTED`.
+4. Pega a segunda. Saldo 20, precisa de 80, rejeita. Ordem `REJECTED` com motivo "saldo insuficiente".
 
-## 10. Tratamento de concorrência
-
-**Cenário:** João tem 100 unidades de ITUB4. Envia duas ordens de venda de 80 unidades cada simultaneamente.
-
-**O que acontece nesta arquitetura:**
-
-1. As duas ordens entram pelo `orders-api` e são publicadas no SQS FIFO com `MessageGroupId = "user-001"`.
-2. SQS FIFO garante que mensagens com o mesmo group ID são entregues em ordem estrita e processadas por **uma única task de cada vez**. Não há paralelismo dentro do grupo.
-3. O `orders-worker` recebe a primeira ordem, abre transação no Aurora, valida saldo (100 disponíveis), debita 80 (sobram 20), commita. Marca a ordem como `EXECUTED`.
-4. O `orders-worker` recebe a segunda ordem, abre transação, valida saldo (20 disponíveis), constata que é insuficiente (precisa 80), rejeita. Marca a ordem como `REJECTED` com motivo "saldo insuficiente".
-
-**Trade-offs:**
-
-- ✅ Consistência forte por usuário, sem locks otimistas no banco. Simples de raciocinar.
-- ✅ Idempotência garantida via constraint única em `idempotencyKey` — se a mesma ordem chega duas vezes, segunda é rejeitada.
-- ⚠️ Throughput por usuário é limitado a aproximadamente 300 mensagens/segundo (limite do FIFO por grupo). Como o produto não espera um único usuário enviando milhares de ordens/segundo, é aceitável.
-- ⚠️ Se o `orders-worker` cai durante a transação, a mensagem volta para a fila e é reprocessada. A operação é idempotente: a constraint de `idempotencyKey` evita dupla execução, e a transação ACID garante que só um estado vence (todo ou nada).
-
----
-
-> Documento elaborado como parte do desafio técnico. O diagrama AWS correspondente está em `order-system.drawio` (com versões `order-system.svg` e `order-system.png` renderizadas pra visualização).
+Funciona sem lock otimista no banco e sem coordenação extra na app. Idempotência vem de uma constraint única em `idempotencyKey`: ordem repetida cai na constraint e é rejeitada.
+A limitação é que cada usuário fica capado em ~300 mensagens/s (limite do FIFO por grupo). para o  perfil do produto isso é confortável; considerei que não há envio de milhares de ordens por segundo no mesmo login.
+Se o worker cai no meio da transação, a mensagem volta para a fila pelo visibility timeout. A operação é idempotente: a constraint protege de execução dupla, e a transação ACID garante atomicidade. Reprocessar é seguro.
